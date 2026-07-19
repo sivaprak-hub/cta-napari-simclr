@@ -73,6 +73,8 @@ class CalciumControls(QWidget):
         self._fps_source       = None
         # cache key: (path, bin, model, mode, val, simclr_epochs)
         self._results_cache    = {}
+        # full UI state per file: results, scores, selected coords, bin size
+        self._file_ui_state    = {}
 
         sw, _sh = _screen_geom()
         panel_w = max(200, sw // 8)
@@ -277,8 +279,69 @@ class CalciumControls(QWidget):
             return
         self.load_file(current.data(Qt.ItemDataRole.UserRole))
 
+    # ------------------------------------------------------------------
+    # Per-file UI state persistence
+    # ------------------------------------------------------------------
+
+    def _snapshot_ui_state(self):
+        """Capture the current file's full UI state before switching away."""
+        if self.last_path is None:
+            return
+        if not hasattr(self, 'results_widget') or self.results_widget.results is None:
+            return
+        self._file_ui_state[self.last_path] = {
+            'results':         self.results_widget.results,
+            'bin_size':        self.results_widget.bin_size,
+            'selected_coords': list(self.results_widget.selected_coords),
+            'lbl_beats':       self.lbl_beats.text(),
+            'lbl_sync':        self.lbl_sync.text(),
+            'lbl_ncc':         self.lbl_ncc.text(),
+            'lbl_emb':         self.lbl_emb.text(),
+        }
+
+    def _restore_ui_state(self, fname):
+        """Rebuild labels, napari layers and trace panel from a saved file state."""
+        state    = self._file_ui_state[fname]
+        results  = state['results']
+        bin_size = state['bin_size']
+        scale    = (bin_size, bin_size)
+
+        self.lbl_beats.setText(state['lbl_beats'])
+        self.lbl_sync.setText(state['lbl_sync'])
+        self.lbl_ncc.setText(state['lbl_ncc'])
+        self.lbl_emb.setText(state['lbl_emb'])
+        self.prog.setValue(100)
+
+        self.viewer.add_image(
+            results['pulsatility_map'],
+            name='Pulsatility', scale=scale, opacity=0.5,
+            colormap='inferno', blending='additive', visible=False,
+        )
+        act_map = results['activation_map']
+        if not np.all(np.isnan(act_map)):
+            self.viewer.add_image(
+                np.nan_to_num(act_map, nan=0.0),
+                name='Wave Map', scale=scale, opacity=0.6,
+                colormap='twilight_shifted', blending='additive',
+            )
+        self.viewer.add_labels(results['clu_map_hdbscan'], name='Clusters (HDBSCAN)', scale=scale, opacity=0.45)
+        self.viewer.add_labels(results['clu_map_ncc'],     name='Clusters (NCC)',     scale=scale, opacity=0.45)
+        self.viewer.add_labels(results['clu_map_simclr'],  name='Clusters (SimCLR)',  scale=scale, opacity=0.45)
+        pts = self.viewer.add_points(name='Selection', ndim=3, size=scale[0] * 2)
+        pts.face_color = 'transparent'
+        pts.edge_color = 'transparent'
+        pts.mode       = 'pan_zoom'
+
+        self.results_widget.results         = results
+        self.results_widget.bin_size        = bin_size
+        self.results_widget.selected_coords = state['selected_coords']
+        self.results_widget.refresh_ui()
+
     def load_file(self, fname):
         try:
+            # Snapshot the outgoing file's full UI state before wiping layers
+            self._snapshot_ui_state()
+
             self.viewer.layers.clear()
             self.raw_stack = load_image(fname)
 
@@ -311,7 +374,9 @@ class CalciumControls(QWidget):
                         "color: #FF5722; font-size: 11px; font-weight: bold;"
                     )
                     self.spin_bin.setValue(16 if max(H, W) < 2048 else 32)
-                    if self.chk_auto.isChecked():
+                    if fname in self._file_ui_state:
+                        self._restore_ui_state(fname)
+                    elif self.chk_auto.isChecked():
                         QMessageBox.warning(
                             self, "FPS Not Detected",
                             f"No FPS metadata found in:\n{os.path.basename(fname)}\n\n"
@@ -324,7 +389,9 @@ class CalciumControls(QWidget):
             self.spin_bin.setValue(16 if max(H, W) < 2048 else 32)
             self._update_frame_info()
 
-            if self.chk_auto.isChecked():
+            if fname in self._file_ui_state:
+                self._restore_ui_state(fname)
+            elif self.chk_auto.isChecked():
                 self.start_analysis()
 
         except Exception as e:
